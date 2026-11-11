@@ -1,7 +1,8 @@
 """
 Google Developer Documentation Style Guide Audit Engine & Scraper.
 Features:
-1. Endless Dynamic Lead Discovery Engine across US, UK, CA, AU, IE, NZ (never runs out).
+1. Curated company discovery with published contact emails and documentation issues
+   verified from each company's own public website.
 2. Intelligent Rollover & Resend of unsent or failed leads from previous runs.
 3. Documentation scraper & passive voice auditor (Google Style Guide: Active Voice).
 4. Tailored cold pitch synthesizer directly injecting passive voice violations.
@@ -10,14 +11,28 @@ Features:
 import re
 import uuid
 import random
+import logging
 import requests
 from bs4 import BeautifulSoup
 from datetime import timedelta
+from urllib.parse import urljoin, urlsplit
 from django.utils import timezone
 from .models import Lead, WorkerState
 
+logger = logging.getLogger(__name__)
+
 # Target global English-speaking markets
 ALLOWED_COUNTRIES = ['US', 'UK', 'CA', 'AU', 'IE', 'NZ']
+ROLE_EMAIL_NAMES = {
+    'contact', 'hello', 'info', 'sales', 'marketing', 'partnerships',
+    'business', 'support', 'developers', 'developer-relations', 'devrel',
+    'docs', 'documentation', 'community', 'team',
+}
+EMAIL_PATTERN = re.compile(
+    r"(?<![\w.+-])[\w.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+"
+)
 
 # Passive voice grammatical patterns: form of "to be" + past participle
 PASSIVE_PATTERNS = [
@@ -115,27 +130,15 @@ DOC_SNIPPET_TEMPLATES = [
     "Session cookies are signed cryptographically using HMAC SHA-256. Expired sessions are purged periodically.",
 ]
 
-COMPANY_PREFIXES = [
-    "Apex", "Nova", "Hyper", "Strata", "Vanguard", "Kestrel", "Zenith", "Prism",
-    "Aura", "Cipher", "Vector", "Pulse", "Synthetix", "Cobalt", "Flux", "Quanta",
-    "Omni", "Loom", "Triton", "Beacon", "Atlas", "Solace", "Kite", "Relay", "Orbit"
-]
-
-COMPANY_SUFFIXES = [
-    "Cloud", "Systems", "Technologies", "Networks", "Data", "Labs", "Platform",
-    "IO", "Security", "AI", "Software", "Infrastructure", "Engineering"
-]
-
-
 def generate_infinite_company_pool(needed_count=30, exclude_names=None):
     """
-    Procedurally synthesizes unique tech companies across target countries (US, UK, CA, AU, IE, NZ)
-    ensuring the catalog never exhausts or runs out. Deduplicates against existing database entries.
+    Returns only unpitched companies from the curated catalog. Never invents companies,
+    domains, contact names, or email addresses.
     """
     exclude = set(exclude_names or [])
     pool = []
 
-    # 1. First add curated entries from TECH_CATALOG that haven't been pitched yet
+    # Return only companies from the explicitly curated catalog.
     catalog_items = []
     for cat_items in TECH_CATALOG.values():
         catalog_items.extend(cat_items)
@@ -145,91 +148,123 @@ def generate_infinite_company_pool(needed_count=30, exclude_names=None):
         if item["name"] not in exclude:
             pool.append({
                 "company_name": item["name"],
-                "contact_name": item.get("lead", "Technical Documentation Team"),
-                "contact_email": f"leads-demo+{re.sub(r'[^a-zA-Z0-9]', '', item['name']).lower()}@{item['domain']}",
+                "contact_name": "Documentation Team",
+                "contact_email": "",
                 "country": item["country"],
+                "domain": item["domain"],
                 "doc_url": f"https://{item['domain']}{item['path']}",
-                "doc_sample": random.choice(DOC_SNIPPET_TEMPLATES)
             })
             exclude.add(item["name"])
             if len(pool) >= needed_count:
                 return pool
 
-    # 2. Procedural infinite generator: combine prefixes, suffixes, domains, and target countries
-    countries = ALLOWED_COUNTRIES.copy()
-    doc_paths = [
-        "/docs/api/quickstart", "/docs/getting-started", "/docs/sdks/overview",
-        "/docs/webhooks/handling", "/docs/authentication", "/docs/rate-limiting",
-        "/docs/architecture", "/docs/rest-api/v1", "/docs/guides/installation"
-    ]
-    tlds = {
-        "US": [".io", ".dev", ".com", ".ai"],
-        "UK": [".co.uk", ".io", ".tech", ".ai"],
-        "CA": [".ca", ".io", ".dev", ".com"],
-        "AU": [".com.au", ".io", ".dev", ".tech"],
-        "IE": [".ie", ".io", ".tech", ".com"],
-        "NZ": [".co.nz", ".nz", ".io", ".dev"]
-    }
-
-    attempts = 0
-    while len(pool) < needed_count and attempts < 1000:
-        attempts += 1
-        country = random.choice(countries)
-        prefix = random.choice(COMPANY_PREFIXES)
-        suffix = random.choice(COMPANY_SUFFIXES)
-        name = f"{prefix} {suffix} {country}"
-
-        if name in exclude:
-            continue
-
-        domain_stem = f"{prefix.lower()}{suffix.lower()}"
-        tld = random.choice(tlds.get(country, [".io", ".dev"]))
-        domain = f"{domain_stem}{tld}"
-        path = random.choice(doc_paths)
-
-        lead_item = {
-            "company_name": name,
-            "contact_name": f"{prefix} Documentation Lead",
-            "contact_email": f"leads-demo+{domain_stem}@{domain}",
-            "country": country,
-            "doc_url": f"https://{domain}{path}",
-            "doc_sample": random.choice(DOC_SNIPPET_TEMPLATES)
-        }
-
-        exclude.add(name)
-        pool.append(lead_item)
-
     return pool
 
 
-def scrape_documentation(url, sample_text=None):
-    """
-    Scrapes the text content of a documentation page.
-    Falls back gracefully to embedded sample text if offline or unreachable.
-    """
-    if sample_text:
-        return sample_text
+def _is_company_host(hostname, company_domain):
+    hostname = (hostname or '').lower().rstrip('.')
+    company_domain = company_domain.lower().rstrip('.')
+    return hostname == company_domain or hostname.endswith(f'.{company_domain}')
 
+
+def _role_email_candidates(emails, company_domain):
+    candidates = set()
+    for email in emails:
+        local_part, separator, email_domain = email.lower().rpartition('@')
+        if not separator or not _is_company_host(email_domain, company_domain):
+            continue
+        role_name = re.sub(r'\+.*$', '', local_part)
+        if role_name in ROLE_EMAIL_NAMES:
+            candidates.add(email.lower())
+    return candidates
+
+
+def discover_public_contact_email(domain, doc_url):
+    """Find a role-based email explicitly published on the company's own website."""
+    page_urls = [f"https://{domain}", doc_url]
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (compatible; TechnicalDocumentationAudit/1.0)',
+        'Accept': 'text/html,application/xhtml+xml'
+    }
+    visited = set()
+    contact_pages = []
+    emails = set()
+
+    def collect_page(url):
+        parsed_url = urlsplit(url)
+        if not _is_company_host(parsed_url.hostname, domain) or url in visited:
+            return
+        visited.add(url)
+        try:
+            page = requests.get(url, headers=headers, timeout=3)
+        except requests.RequestException as exc:
+            logger.info("Contact discovery request failed for %s: %s", url, exc)
+            return
+
+        final_url = urlsplit(page.url or url)
+        if not _is_company_host(final_url.hostname, domain) or page.status_code != 200:
+            return
+        content_type = page.headers.get('Content-Type', '')
+        if content_type and 'html' not in content_type.lower():
+            return
+
+        soup = BeautifulSoup(page.text, 'html.parser')
+        for anchor in soup.select('a[href]'):
+            href = anchor.get('href', '').strip()
+            if href.lower().startswith('mailto:'):
+                emails.update(EMAIL_PATTERN.findall(href[7:].split('?', 1)[0]))
+                continue
+            absolute_url = urljoin(page.url or url, href)
+            path = urlsplit(absolute_url).path.lower()
+            if (
+                _is_company_host(urlsplit(absolute_url).hostname, domain)
+                and re.search(r'contact|about|support|company', path)
+            ):
+                contact_pages.append(absolute_url)
+
+        emails.update(EMAIL_PATTERN.findall(soup.get_text(' ', strip=True)))
+
+    for url in page_urls:
+        collect_page(url)
+        if _role_email_candidates(emails, domain):
+            break
+
+    for url in contact_pages:
+        if len(visited) >= 4:
+            break
+        collect_page(url)
+        if _role_email_candidates(emails, domain):
+            break
+
+    candidates = _role_email_candidates(emails, domain)
+    return sorted(candidates)[0] if candidates else ''
+
+
+def scrape_documentation(url):
+    """
+    Scrapes actual documentation text. Returns empty when the page cannot be verified.
+    """
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
         }
         resp = requests.get(url, headers=headers, timeout=4)
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            for tag in soup(['script', 'style', 'nav', 'header', 'footer', 'noscript', 'svg']):
-                tag.decompose()
+    except requests.RequestException as exc:
+        logger.info("Documentation request failed for %s: %s", url, exc)
+        return ''
 
-            main_content = soup.find('article') or soup.find('main') or soup.find('div', role='main') or soup.body
-            if main_content:
-                text = main_content.get_text(separator=' ', strip=True)
-                cleaned = re.sub(r'\s+', ' ', text)
-                return cleaned[:4000]
-    except Exception:
-        pass
+    if resp.status_code != 200:
+        return ''
 
-    return sample_text or "Documentation content unavailable for direct crawl."
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    for tag in soup(['script', 'style', 'nav', 'header', 'footer', 'noscript', 'svg']):
+        tag.decompose()
+
+    main_content = soup.find('article') or soup.find('main') or soup.find('div', role='main') or soup.body
+    if not main_content:
+        return ''
+    return re.sub(r'\s+', ' ', main_content.get_text(separator=' ', strip=True))[:4000]
 
 
 def audit_passive_voice(text):
@@ -268,57 +303,113 @@ def audit_passive_voice(text):
         if len(violations) >= 3:
             break
 
-    if not violations:
-        violations.append({
-            "sentence": "When requests are processed by the gateway, headers are validated.",
-            "passive_phrase": "are processed by",
-            "rule": "Google Style Guide: Active Voice",
-            "suggestion": "The gateway processes requests and validates headers."
-        })
-
     return violations
 
 
-def synthesize_pitch(company_name, contact_name, doc_url, violations, country):
+def synthesize_pitch(company_name, contact_name, violations, variation=0):
     """
-    LLM Audit Hook Synthesizer:
-    Injects specific passive voice findings from the Google Style Guide audit
-    directly into a high-converting cold pitch.
+    Creates a conversational, personalized introduction using the audit finding.
     """
-    v = violations[0] if violations else {
-        "passive_phrase": "is executed by",
-        "sentence": "The payload is received by the backend endpoint.",
-        "suggestion": "The backend endpoint receives the payload."
-    }
+    if not violations:
+        raise ValueError("A verified documentation issue is required to create a pitch.")
+    v = violations[0]
 
     hook_snippet = (
-        f"While auditing your public documentation at {doc_url}, I ran a check against the "
-        f"Google Developer Documentation Style Guide (specifically the Active Voice standard). "
-        f"I spotted sentences like:\n"
+        f"Example of an active-voice edit:\n"
         f"  \"{v['sentence']}\"\n"
-        f"where passive phrasing (\"{v['passive_phrase']}\") slows down developer time-to-first-hello-world. "
-        f"A direct active rewrite like: \"{v['suggestion']}\" makes API docs 30% faster to scan."
+        f"Suggested rewrite:\n"
+        f"  \"{v['suggestion']}\"\n"
+        "This is an illustrative example, not a measured performance claim."
     )
 
-    subject = f"Quick Google Style Guide audit for {company_name}'s docs"
-    recipient_salutation = f"Hi {contact_name.split()[0]}" if contact_name and "Team" not in contact_name and "Lead" not in contact_name else f"Hi {company_name} team"
+    subject_templates = (
+        "A small suggestion for {company_name}'s developer docs",
+        "Quick thought about your API documentation",
+        "Could this sentence be clearer?",
+        "A documentation note for {company_name}",
+        "One idea for your developer docs",
+    )
+    body_templates = (
+        """Hi {salutation},
 
-    body = f"""{recipient_salutation},
+I wanted to introduce myself. I'm a technical writer who helps teams make developer documentation easier to use.
 
-{hook_snippet}
+Here's a quick example of the kind of edit I work on:
+“{sentence}”
+→ “{suggestion}”
 
-I help engineering-led tech companies across {country} polish their developer documentation, API references, and quickstarts into clear, conversion-oriented guides that reduce developer support tickets.
+If a review of {company_name}'s docs would be useful, I can take a look and send a few specific notes. Would you be open to that?
 
-I put together a quick 3-page Google Style Guide audit with active-voice rewrites and structure suggestions specifically for {company_name}'s developer docs.
+No worries if it's not a priority.
 
-Would you be open to me sending over the free audit notes?
+Best,
+Emmanuel Samuel
+emmz3230@gmail.com
+https://samuel-emmanuel-technical-writer.netlify.app/""",
+        """Hi {salutation},
 
-Best regards,
+I'm reaching out because I work with teams on their developer documentation. A simple example of an edit I often make:
+“{sentence}” → “{suggestion}”
 
+If you'd like, I could review a page from {company_name}'s docs and send back a few practical suggestions. Would that be helpful?
+
+Best,
 Technical Writing Consultant
 emmz3230@gmail.com
-portfolio: https://samuel-emmanuel-technical-writer.netlify.app/
-"""
+https://samuel-emmanuel-technical-writer.netlify.app/""",
+        """Hi {salutation},
+
+Thought I'd share a small example of the kind of documentation work I do:
+“{sentence}”
+could become
+“{suggestion}”
+
+I'm a technical writer, and I help make docs clearer for developers. If you'd like me to take a look at {company_name}'s docs, just say the word. If not, all good.
+
+Thanks,
+Technical Writing Consultant
+emmz3230@gmail.com
+https://samuel-emmanuel-technical-writer.netlify.app/""",
+        """Hi {salutation},
+
+I'm a technical writing consultant, and one small example of what I help with is turning passive sentences into direct instructions:
+“{sentence}” → “{suggestion}”
+
+Would it be useful if I reviewed a page from {company_name}'s documentation and shared a few notes? Happy to keep it brief.
+
+Best,
+Technical Writing Consultant
+emmz3230@gmail.com
+https://samuel-emmanuel-technical-writer.netlify.app/""",
+        """Hi {salutation},
+
+Hope your week's going well. I'm reaching out to introduce my technical writing work. For example, an edit might look like this:
+“{sentence}”
+becomes
+“{suggestion}”
+
+If documentation improvements are on your list, I could review a page from {company_name} and send a few tailored ideas. Just let me know.
+
+Regards,
+Technical Writing Consultant
+emmz3230@gmail.com
+https://samuel-emmanuel-technical-writer.netlify.app/""",
+    )
+    variant = variation % len(body_templates)
+    recipient_salutation = (
+        contact_name.split()[0]
+        if contact_name and "Team" not in contact_name and "Lead" not in contact_name
+        else f"{company_name} team"
+    )
+    template_values = {
+        "company_name": company_name,
+        "salutation": recipient_salutation,
+        "sentence": v["sentence"],
+        "suggestion": v["suggestion"],
+    }
+
+    subject = subject_templates[variant].format(company_name=company_name)
+    body = body_templates[variant].format(**template_values)
 
     return {
         "subject": subject,
@@ -338,10 +429,13 @@ def get_unsent_and_failed_leads(limit=30):
     # Expired queued leads (scheduled more than 2 hours ago but never sent)
     stale_queued = Lead.objects.filter(
         status='queued',
+        contact_email__gt='',
         scheduled_send_time__lt=now - timedelta(hours=2)
-    )
+    ).exclude(contact_email__istartswith='leads-demo+')
     # Failed leads that have not yet succeeded
-    failed_leads = Lead.objects.filter(status='failed').order_by('-updated_at')
+    failed_leads = Lead.objects.filter(status='failed', contact_email__gt='').exclude(
+        contact_email__istartswith='leads-demo+'
+    ).order_by('-updated_at')
 
     combined_ids = list(stale_queued.values_list('id', flat=True)[:limit])
     remaining_slots = limit - len(combined_ids)
@@ -356,9 +450,9 @@ def prepare_daily_batch(count=30, include_rollover=True):
     Core Daily Dispatch Engine:
     1. Rollover: Automatically fetches unsent & failed leads from yesterday/earlier runs,
        resets their status to 'queued', increments retry_count, and schedules them first.
-    2. Endless Discovery: Generates brand-new, fresh unique leads from the dynamic catalog
-       to fulfill the remaining slots up to the exact daily count of 30.
-    3. Spacing: Spaces out ALL 30 leads across exact 20-minute intervals starting from now!
+    2. Discovery: Queues only curated companies with a published role email and a verified
+       documentation issue. The batch can be smaller than requested.
+    3. Spacing: Schedules verified leads 20 minutes apart starting from now.
     """
     now = timezone.now()
     batch_id = str(uuid.uuid4())[:8]
@@ -386,30 +480,50 @@ def prepare_daily_batch(count=30, include_rollover=True):
     # Step 2: Determine how many fresh new leads are needed to reach exact target (30)
     needed_new = count - len(final_leads)
     if needed_new > 0:
-        # Existing companies in database to avoid duplicate pitches
-        existing_companies = set(Lead.objects.values_list('company_name', flat=True))
-        new_items = generate_infinite_company_pool(needed_count=needed_new, exclude_names=existing_companies)
+        WorkerState.objects.update_or_create(
+            id=1,
+            defaults={'last_auto_generate_date': timezone.localdate()},
+        )
+        # Avoid repeating companies that have a real email address on an existing lead.
+        existing_companies = set(
+            Lead.objects.exclude(contact_email='')
+            .exclude(contact_email__istartswith='leads-demo+')
+            .values_list('company_name', flat=True)
+        )
+        catalog_size = sum(len(items) for items in TECH_CATALOG.values())
+        new_items = generate_infinite_company_pool(
+            needed_count=catalog_size,
+            exclude_names=existing_companies
+        )
 
         new_leads_to_create = []
         for item in new_items:
-            scheduled_time = now + timedelta(minutes=scheduled_slot * 20)
-
-            # Audit docs & synthesize pitch
-            doc_text = scrape_documentation(item['doc_url'], sample_text=item.get('doc_sample'))
+            doc_text = scrape_documentation(item['doc_url'])
+            if not doc_text:
+                logger.info("Skipping %s: documentation page could not be verified.", item['company_name'])
+                continue
             violations = audit_passive_voice(doc_text)
+            if not violations:
+                logger.info("Skipping %s: no passive-voice issue was found.", item['company_name'])
+                continue
+            contact_email = discover_public_contact_email(item['domain'], item['doc_url'])
+            if not contact_email:
+                logger.info("Skipping %s: no published role contact email was found.", item['company_name'])
+                continue
+
+            scheduled_time = now + timedelta(minutes=scheduled_slot * 20)
             pitch = synthesize_pitch(
                 company_name=item['company_name'],
                 contact_name=item['contact_name'],
-                doc_url=item['doc_url'],
                 violations=violations,
-                country=item['country']
+                variation=scheduled_slot
             )
 
             new_lead = Lead(
                 batch_id=batch_id,
                 company_name=item['company_name'],
                 contact_name=item['contact_name'],
-                contact_email=item['contact_email'],
+                contact_email=contact_email,
                 country=item['country'],
                 doc_url=item['doc_url'],
                 documentation_snippet=pitch['snippet'],
@@ -423,9 +537,18 @@ def prepare_daily_batch(count=30, include_rollover=True):
             )
             new_leads_to_create.append(new_lead)
             scheduled_slot += 1
+            if len(new_leads_to_create) >= needed_new:
+                break
 
         Lead.objects.bulk_create(new_leads_to_create)
         final_leads.extend(new_leads_to_create)
+        if len(new_leads_to_create) < needed_new:
+            logger.warning(
+                "Only %s of %s requested new leads had both a published role email and "
+                "a verified documentation issue.",
+                len(new_leads_to_create),
+                needed_new,
+            )
 
     return final_leads
 

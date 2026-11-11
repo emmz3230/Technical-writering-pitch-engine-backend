@@ -2,14 +2,16 @@
 Continuous Background Scheduler & Silent SMTP Email Dispatcher.
 Checks the database every minute for leads whose scheduled_send_time <= current_time,
 validates pause state and daily 30-pitch caps, dispatches via Django SMTP backend,
-and automatically generates fresh daily 30-lead queues with rollover of unsent leads.
+and discovers verified prospects for the daily queue.
 """
 
 import time
 import logging
 import threading
 from datetime import timedelta, date
+from django.core.exceptions import ValidationError
 from django.utils import timezone
+from django.core.validators import validate_email
 from django.core.mail import EmailMessage
 from django.conf import settings
 from .models import Lead, WorkerState
@@ -34,10 +36,29 @@ def send_lead_email(lead):
     Sends cold pitch email silently via Django's configured SMTP backend.
     Updates lead status to 'sent' (with timestamp) or 'failed' (with error message).
     """
-    logger.info(f"Dispatching cold pitch to {lead.company_name} <{lead.contact_email}>...")
+    recipient = (lead.contact_email or '').strip()
+    if not recipient or recipient.lower().startswith('leads-demo+'):
+        lead.status = 'failed'
+        lead.error_message = (
+            "No real contact email is available. Add a valid recipient address before sending."
+        )
+        lead.save(update_fields=['status', 'error_message', 'updated_at'])
+        logger.warning(f"Not sending to {lead.company_name}: no real contact email is available.")
+        return False
+
+    try:
+        validate_email(recipient)
+    except ValidationError:
+        lead.status = 'failed'
+        lead.error_message = "The contact email address is invalid. Correct it before sending."
+        lead.save(update_fields=['status', 'error_message', 'updated_at'])
+        logger.warning(f"Not sending to {lead.company_name}: invalid contact email address.")
+        return False
+
+    logger.info(f"Dispatching cold pitch to {lead.company_name} <{recipient}>...")
 
     from_email = getattr(settings, 'DEFAULT_FROM_EMAIL', None) or getattr(settings, 'EMAIL_HOST_USER', 'noreply@coldpitchengine.local')
-    recipient_list = [lead.contact_email]
+    recipient_list = [recipient]
 
     try:
         email = EmailMessage(
@@ -79,9 +100,8 @@ def check_and_auto_generate_daily_batch(state):
     """
     Automated Daily Schedule & Rollover Check:
     1. If the day has rolled over, resets daily_sent_count.
-    2. If auto_generate_daily is enabled and the active queue has fewer than 5 queued leads,
-       automatically rolls over any previous unsent/failed leads and generates fresh leads
-       to fill the daily 30-lead queue, spaced out in 20-minute increments!
+    2. If automatic generation is enabled and the queue is empty, make at most one
+       verified-prospect discovery attempt per day.
     """
     today = timezone.localdate() if hasattr(timezone, 'localdate') else timezone.now().date()
     reset_date = state.last_reset_date
@@ -100,12 +120,21 @@ def check_and_auto_generate_daily_batch(state):
     if state.auto_generate_daily and not state.is_paused:
         active_queued_count = Lead.objects.filter(status='queued').count()
         # If queue is depleted and we haven't reached daily cap
-        if active_queued_count == 0 and state.daily_sent_count < daily_limit:
+        if (
+            active_queued_count == 0
+            and state.daily_sent_count < daily_limit
+            and state.last_auto_generate_date != today
+        ):
             needed = daily_limit - state.daily_sent_count
-            logger.info(f"[Daily Auto-Scheduler] Active queue empty. Automatically generating {needed} leads with rollover of past unsent leads...")
+            state.last_auto_generate_date = today
+            state.save(update_fields=['last_auto_generate_date', 'updated_at'])
+            logger.info(f"[Daily Auto-Scheduler] Active queue empty. Discovering up to {needed} verified leads...")
             batch = prepare_daily_batch(count=needed, include_rollover=True)
-            logger.info(f"[Daily Auto-Scheduler] Generated {len(batch)} scheduled leads across 20-min intervals.")
-            state.last_run_status = f"Auto-scheduled {len(batch)} daily leads"
+            logger.info(f"[Daily Auto-Scheduler] Scheduled {len(batch)} verified leads.")
+            state.last_run_status = (
+                f"Auto-scheduled {len(batch)} verified leads"
+                if batch else "No verified prospects found today; try generating again later."
+            )
             state.save(update_fields=['last_run_status'])
 
 

@@ -14,8 +14,9 @@ class WorkerState(models.Model):
     daily_sent_count = models.PositiveIntegerField(default=0)
     last_reset_date = models.DateField(default=datetime.date.today)
     last_poll_time = models.DateTimeField(null=True, blank=True)
+    last_auto_generate_date = models.DateField(null=True, blank=True)
     last_run_status = models.CharField(max_length=120, default='Idle')
-    auto_generate_daily = models.BooleanField(default=True, help_text="Automatically generate fresh 30-lead queue on date rollover")
+    auto_generate_daily = models.BooleanField(default=True, help_text="Discover verified prospects for the daily queue")
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
@@ -79,7 +80,7 @@ class Lead(models.Model):
     batch_id = models.CharField(max_length=64, blank=True, db_index=True)
     company_name = models.CharField(max_length=255)
     contact_name = models.CharField(max_length=255, blank=True, default='Technical Documentation Team')
-    contact_email = models.EmailField()
+    contact_email = models.EmailField(blank=True, default='')
     country = models.CharField(max_length=10, choices=COUNTRY_CHOICES, default='US')
     doc_url = models.URLField(max_length=500)
 

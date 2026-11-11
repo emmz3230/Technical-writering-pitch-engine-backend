@@ -26,27 +26,36 @@ class LeadListView(views.APIView):
 
 class GenerateBatchView(views.APIView):
     """
-    Generates a batch of up to 30 leads across global English-speaking markets (US, UK, CA, AU, IE, NZ).
-    Automatically rolls over previous unsent/failed leads and generates fresh unique leads from the
-    infinite catalog for remaining slots, spacing out their scheduled_send_time by exactly 20-minute increments.
+    Generates up to 30 leads using published role addresses and verified issues found on
+    curated companies' own websites. Unverified companies are skipped.
     """
     def post(self, request):
         count = int(request.data.get('count', 30))
         include_rollover = request.data.get('include_rollover', True)
         count = min(count, 30)
 
-        # Ensure background scheduler is running
-        start_background_scheduler()
-
         leads = prepare_daily_batch(count=count, include_rollover=include_rollover)
+        start_background_scheduler()
         serializer = LeadSerializer(leads, many=True)
 
         rollover_count = sum(1 for l in leads if getattr(l, 'is_rollover', False))
         new_count = len(leads) - rollover_count
+        requested_new = max(0, count - rollover_count)
+        if new_count < requested_new:
+            message = (
+                f"Scheduled {len(leads)} verified leads. Found {new_count} of "
+                f"{requested_new} requested new prospects with both a published role "
+                "email and a verified documentation issue."
+            )
+        else:
+            message = (
+                f"Scheduled {len(leads)} leads: {rollover_count} rolled-over and "
+                f"{new_count} verified new prospects."
+            )
 
         return response.Response({
             'success': True,
-            'message': f"Scheduled {len(leads)} leads: {rollover_count} rolled-over unsent, {new_count} brand-new fresh leads.",
+            'message': message,
             'batch_size': len(leads),
             'rollover_count': rollover_count,
             'new_count': new_count,
